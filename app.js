@@ -8,12 +8,6 @@ const glucoseFileName = document.getElementById('glucoseFileName');
 const notesFileName = document.getElementById('notesFileName');
 
 // DTOs
-class GlucoseRawData {
-    constructor(timestamp, rate) {
-        this.timestamp = timestamp;
-        this.rate = rate;
-    }
-}
 
 class NoteData {
     constructor(timestamp, note, details) {
@@ -24,11 +18,11 @@ class NoteData {
 }
 
 class GlucoseFullData {
-    constructor(timestamp, glucoseData = null, noteData = null) {
+    constructor(timestamp, rate = null, note = null, details = null) {
         this.timestamp = timestamp;
-        this.glucoseRate = glucoseData ? glucoseData.rate : null;
-        this.note = noteData ? noteData.note : null;
-        this.details = noteData ? noteData.details : null;
+        this.glucoseRate = rate;
+        this.note = note;
+        this.details = details;
     }
 }
 
@@ -126,21 +120,14 @@ function handleTextInput(event) {
 }
 
 function updateParseButtonState() {
-    const hasGlucoseData = glucoseFile || glucoseText;
-    const hasNotesData = notesFile || notesText;
-
-    if (hasGlucoseData && hasNotesData) {
-        parseBtn.disabled = false;
-    } else {
-        parseBtn.disabled = true;
-    }
+    parseBtn.disabled = !glucoseFile;
 }
 
 async function handleParse() {
     const hasGlucoseData = glucoseFile || glucoseText;
     const hasNotesData = notesFile || notesText;
 
-    if (!hasGlucoseData || !hasNotesData) return;
+    if (!hasGlucoseData) return;
 
     try {
         parseBtn.disabled = true;
@@ -184,6 +171,7 @@ function parseGlucoseCSVText(csvText) {
     // Check for both mmol/L and mg/dL units
     let historicGlucoseIndex = headers.indexOf('Historic Glucose mmol/L');
     let scanGlucoseIndex = headers.indexOf('Scan Glucose mmol/L');
+    let notesIndex = headers.indexOf('Notes');
     let isMgDl = false;
 
     if (historicGlucoseIndex === -1 && scanGlucoseIndex === -1) {
@@ -193,7 +181,7 @@ function parseGlucoseCSVText(csvText) {
         isMgDl = true;
     }
 
-    console.log("parsed indexes: ", timestampIndex, historicGlucoseIndex, scanGlucoseIndex, "isMgDl:", isMgDl);
+    console.log("parsed indexes: ", timestampIndex, historicGlucoseIndex, scanGlucoseIndex, notesIndex, "isMgDl:", isMgDl);
 
     if (timestampIndex === -1 || (historicGlucoseIndex === -1 && scanGlucoseIndex === -1)) {
         throw new Error('Invalid CSV format for glucose data. Expected columns: Device Timestamp and either Historic/Scan Glucose in mmol/L or mg/dL');
@@ -205,28 +193,58 @@ function parseGlucoseCSVText(csvText) {
     for (let i = 2; i < lines.length; i++) {
         if (!lines[i].trim()) continue;
 
-        const values = lines[i].split(',').map(v => v.trim());
+        let values = [];
+        const raw_values = lines[i].split(',');
+        for (val_idx = 0; val_idx < raw_values.length; ++val_idx) {
+            let raw_val = raw_values[val_idx];
+            if (raw_val.startsWith('"')) {
+                // Field starts with double quotes, so join later spuriously split fields until we find the closing quote.
+                // Does not handle double-double-quotes within the field value.
+                raw_val = raw_val.substring(1);
+                while (val_idx < raw_values.length && !raw_val.endsWith('"')) {
+                    // join with next field, with a comma
+                    raw_val += ', ' + raw_values[++val_idx];
+                }
+                if (raw_val.endsWith('"')) {
+                    raw_val = raw_val.substring(0, raw_val.length-1);
+                }
+            }
+            values.push(raw_val.trim())
+        }
         const timestampStr = values[timestampIndex];
         if (!timestampStr) continue;
         const timestamp = toDate(timestampStr);
 
-        // If already have a value for this timestamp, skip unless this is the first Historic Glucose
-        if (resultMap.has(timestamp.getTime())) continue;
-
         let rate = null;
+        let notes = values[notesIndex] || null;
         if (values[historicGlucoseIndex]) {
             rate = parseFloat(values[historicGlucoseIndex]);
         } else if (values[scanGlucoseIndex]) {
             rate = parseFloat(values[scanGlucoseIndex]);
         }
-        if (rate === null || isNaN(rate)) continue;
 
-        // Convert mg/dL to mmol/L if needed (mg/dL × 0.0555 = mmol/L)
-        if (isMgDl) {
+        if (rate === null || isNaN(rate)) {
+            if (notes === null ) continue;      // Neither rate nor notes in this record.
+        }
+        else if (isMgDl) {
+            // Convert mg/dL to mmol/L if needed (mg/dL × 0.0555 = mmol/L)
             rate = rate * 0.0555;
         }
 
-        resultMap.set(timestamp.getTime(), new GlucoseRawData(timestamp, rate));
+        if (resultMap.has(timestamp.getTime())) {
+            // already have a record for this time. Leave rate unchanged, but set or append notes, if any.
+            let rec = resultMap.get(timestamp.getTime());
+            if ( (rec.note === undefined) || (rec.note === null) ) {
+                rec.note = notes;
+            }
+            else {
+                rec.note += '; ' + notes;
+            }
+        }
+        else
+        {
+            resultMap.set(timestamp.getTime(), new GlucoseFullData(timestamp, rate, notes, null));
+        }
     }
 
     return Array.from(resultMap.values());
@@ -250,6 +268,9 @@ async function parseGlucoseCSV(file) {
 
 // Shared notes parsing logic
 function parseNotesCSVText(csvText) {
+    if (!csvText) {
+        return null;
+    }
     const lines = csvText.split('\n');
     const headers = lines[0].split(';').map(h => h.trim());
     console.log("notes headers", headers.join('\n'));
@@ -305,23 +326,22 @@ function joinDataByTimestamp(glucoseData, notesData) {
     // Add all glucose data to the map
     for (const glucose of glucoseData) {
         const timeKey = glucose.timestamp.getTime();
-        resultMap.set(timeKey, new GlucoseFullData(glucose.timestamp, glucose, null));
+        resultMap.set(timeKey, glucose);
     }
 
     // Add or update with notes data
-    for (const note of notesData) {
-        const timeKey = note.timestamp.getTime();
-        if (resultMap.has(timeKey)) {
-            // Update existing entry with notes
-            const existing = resultMap.get(timeKey);
-            resultMap.set(timeKey, new GlucoseFullData(
-                existing.timestamp, // Use existing timestamp to maintain consistency
-                { rate: existing.glucoseRate },
-                note
-            ));
-        } else {
-            // Add new entry with just notes
-            resultMap.set(timeKey, new GlucoseFullData(note.timestamp, null, note));
+    if (notesData) {
+        for (const note of notesData) {
+            const timeKey = note.timestamp.getTime();
+            if (resultMap.has(timeKey)) {
+                // Update existing entry with notes
+                const existing = resultMap.get(timeKey);
+                existing.note = note.note;
+                existing.details = note.details;
+            } else {
+                // Add new entry with just notes
+                resultMap.set(timeKey, new GlucoseFullData(note.timestamp, null, note.note, note.details));
+            }
         }
     }
 
